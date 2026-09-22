@@ -346,8 +346,15 @@ class Anthropic(FunctionCallingLLM):
     def _completion_response_from_chat_response(
         self, chat_response: AnthropicChatResponse
     ) -> AnthropicCompletionResponse:
+        # Extract text from blocks if content is None (blocks-based response)
+        text = chat_response.message.content
+        if text is None and chat_response.message.blocks:
+            text = ''.join(
+                block.text for block in chat_response.message.blocks
+                if hasattr(block, 'text') and block.text
+            )
         return AnthropicCompletionResponse(
-            text=chat_response.message.content,
+            text=text or '',
             delta=chat_response.delta,
             additional_kwargs=chat_response.additional_kwargs,
             raw=chat_response.raw,

@@ -21,7 +21,7 @@ from llama_index.core.base.llms.types import (
 from llama_index.core.base.llms.types import ThinkingBlock
 from llama_index.core.tools import FunctionTool
 from llama_index.llms.anthropic import Anthropic
-from llama_index.llms.anthropic.base import AnthropicChatResponse
+from llama_index.llms.anthropic.base import AnthropicChatResponse, AnthropicCompletionResponse
 from llama_index.llms.anthropic.utils import messages_to_anthropic_messages
 
 
@@ -740,3 +740,722 @@ async def test_astream_chat_usage_and_stop_reason():
     assert isinstance(stop_reason, str)
     print(f"Async - Stop reason: {stop_reason}")
     print(f"Async - Usage: {usage}")
+
+
+
+
+# =============================================================================
+# Unit tests for uncovered code paths
+# =============================================================================
+
+
+def _create_real_text_block(text: str):
+    """Create a real anthropic TextBlock."""
+    from anthropic.types import TextBlock
+    return TextBlock(text=text, type="text", citations=None)
+
+
+def _create_real_tool_use_block(tool_name: str, tool_input: dict, tool_id: str = "test_tool_id"):
+    """Create a real anthropic ToolUseBlock."""
+    from anthropic.types import ToolUseBlock
+    return ToolUseBlock(
+        id=tool_id,
+        input=tool_input,
+        name=tool_name,
+        type="tool_use",
+    )
+
+
+def _create_real_thinking_block(thinking_text: str):
+    """Create a real anthropic ThinkingBlock."""
+    from anthropic.types import ThinkingBlock
+    return ThinkingBlock(
+        thinking=thinking_text,
+        type="thinking",
+        signature="test_signature",
+    )
+
+
+def _create_mock_messages_response(content_blocks: list) -> MagicMock:
+    """Create a mock response from anthropic client's messages.create()."""
+    response = MagicMock()
+    response.content = content_blocks
+    response.id = "test_msg_id"
+    response.model = "claude-sonnet-4-5-20250929"
+    response.role = "assistant"
+    response.stop_reason = "end_turn"
+    response.stop_sequence = None
+    response.type = "message"
+    response.usage = MagicMock()
+    response.usage.input_tokens = 10
+    response.usage.output_tokens = 20
+    return response
+
+
+def test_chat_basic():
+    """Test basic chat functionality with mocked client."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    # Create mock response with real anthropic TextBlock
+    mock_response = _create_mock_messages_response(
+        [_create_real_text_block("Hello! How can I help you?")]
+    )
+
+    # Mock the client
+    llm._client = MagicMock()
+    llm._client.messages.create.return_value = mock_response
+
+    messages = [ChatMessage(role=MessageRole.USER, content="Hi")]
+    response = llm.chat(messages)
+
+    assert isinstance(response, AnthropicChatResponse)
+    assert response.message.role == MessageRole.ASSISTANT
+    assert response.message.content == "Hello! How can I help you?"
+    assert response.citations == []
+    llm._client.messages.create.assert_called_once()
+
+
+def test_chat_with_tool_call():
+    """Test chat with tool call response."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    mock_response = _create_mock_messages_response(
+        [
+            _create_real_text_block("Let me search for that."),
+            _create_real_tool_use_block(
+                "search_tool", {"query": "weather in Paris"}, "tool_call_1"
+            ),
+        ]
+    )
+
+    llm._client = MagicMock()
+    llm._client.messages.create.return_value = mock_response
+
+    messages = [ChatMessage(role=MessageRole.USER, content="What is the weather in Paris?")]
+    response = llm.chat(messages)
+
+    assert isinstance(response, AnthropicChatResponse)
+    assert len(response.message.blocks) == 2
+    tool_blocks = [b for b in response.message.blocks if isinstance(b, ToolCallBlock)]
+    assert len(tool_blocks) == 1
+    assert tool_blocks[0].tool_name == "search_tool"
+    assert tool_blocks[0].tool_kwargs == {"query": "weather in Paris"}
+
+
+def test_chat_with_thinking():
+    """Test chat with thinking block."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    mock_response = _create_mock_messages_response(
+        [
+            _create_real_thinking_block("I need to think about this..."),
+            _create_real_text_block("The answer is 42."),
+        ]
+    )
+
+    llm._client = MagicMock()
+    llm._client.messages.create.return_value = mock_response
+
+    messages = [ChatMessage(role=MessageRole.USER, content="What is the meaning of life?")]
+    response = llm.chat(messages)
+
+    assert isinstance(response, AnthropicChatResponse)
+    thinking_blocks = [b for b in response.message.blocks if hasattr(b, "content") and hasattr(b, "additional_information")]
+    assert len(thinking_blocks) == 1
+    assert thinking_blocks[0].content == "I need to think about this..."
+
+
+def test_complete():
+    """Test complete method."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    mock_response = _create_mock_messages_response(
+        [_create_real_text_block("Paul Graham is a programmer, writer, and investor.")]
+    )
+
+    llm._client = MagicMock()
+    llm._client.messages.create.return_value = mock_response
+
+    response = llm.complete("Paul Graham is ")
+
+    assert response.text == "Paul Graham is a programmer, writer, and investor."
+    assert isinstance(response, AnthropicCompletionResponse)
+
+
+def test_completion_response_from_chat_response():
+    """Test _completion_response_from_chat_response."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    chat_response = AnthropicChatResponse(
+        message=ChatMessage(role=MessageRole.ASSISTANT, content="Test response"),
+        delta="Test response",
+        citations=[],
+        raw={},
+    )
+
+    completion_response = llm._completion_response_from_chat_response(chat_response)
+    assert isinstance(completion_response, AnthropicCompletionResponse)
+    assert completion_response.text == "Test response"
+    assert completion_response.delta == "Test response"
+
+
+def test_get_blocks_and_tool_calls_and_thinking():
+    """Test _get_blocks_and_tool_calls_and_thinking with various block types."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    # Create a mock response with text, tool use, and thinking blocks
+    mock_response = MagicMock()
+    text_block = _create_real_text_block("Hello")
+    tool_block = _create_real_tool_use_block("test_tool", {"key": "value"}, "tool_1")
+    thinking_block = _create_real_thinking_block("Thinking...")
+
+    mock_response.content = [text_block, tool_block, thinking_block]
+
+    blocks, citations = llm._get_blocks_and_tool_calls_and_thinking(mock_response)
+
+    assert len(blocks) == 3
+    assert len(citations) == 0
+
+    # Check text block
+    text_blocks = [b for b in blocks if hasattr(b, "text")]
+    assert len(text_blocks) == 1
+    assert text_blocks[0].text == "Hello"
+
+    # Check tool call block
+    tool_blocks = [b for b in blocks if isinstance(b, ToolCallBlock)]
+    assert len(tool_blocks) == 1
+    assert tool_blocks[0].tool_name == "test_tool"
+    assert tool_blocks[0].tool_kwargs == {"key": "value"}
+
+    # Check thinking block
+    thinking_blocks = [b for b in blocks if hasattr(b, "content") and hasattr(b, "additional_information")]
+    assert len(thinking_blocks) == 1
+    assert thinking_blocks[0].content == "Thinking..."
+
+
+def test_get_tool_calls_from_response():
+    """Test get_tool_calls_from_response."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    # Create a chat response with tool calls
+    response = AnthropicChatResponse(
+        message=ChatMessage(
+            role=MessageRole.ASSISTANT,
+            blocks=[
+                ToolCallBlock(
+                    tool_name="search_tool",
+                    tool_kwargs={"query": "test"},
+                    tool_call_id="call_1",
+                ),
+                ToolCallBlock(
+                    tool_name="weather_tool",
+                    tool_kwargs={"location": "Paris"},
+                    tool_call_id="call_2",
+                ),
+            ],
+        ),
+    )
+
+    tool_selections = llm.get_tool_calls_from_response(response)
+    assert len(tool_selections) == 2
+    assert tool_selections[0].tool_name == "search_tool"
+    assert tool_selections[0].tool_kwargs == {"query": "test"}
+    assert tool_selections[1].tool_name == "weather_tool"
+    assert tool_selections[1].tool_kwargs == {"location": "Paris"}
+
+
+def test_get_tool_calls_from_response_no_tools():
+    """Test get_tool_calls_from_response with no tool calls and error_on_no_tool_call=False."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    response = AnthropicChatResponse(
+        message=ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content="No tools here",
+        ),
+    )
+
+    tool_selections = llm.get_tool_calls_from_response(response, error_on_no_tool_call=False)
+    assert len(tool_selections) == 0
+
+
+def test_get_tool_calls_from_response_no_tools_error():
+    """Test get_tool_calls_from_response with no tool calls and error_on_no_tool_call=True."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    response = AnthropicChatResponse(
+        message=ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content="No tools here",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Expected at least one tool call"):
+        llm.get_tool_calls_from_response(response, error_on_no_tool_call=True)
+
+
+def test_validate_chat_with_tools_response():
+    """Test _validate_chat_with_tools_response."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    response = AnthropicChatResponse(
+        message=ChatMessage(role=MessageRole.ASSISTANT, content="Test"),
+    )
+
+    # Should return the response unchanged (no parallel tool calls to validate)
+    validated = llm._validate_chat_with_tools_response(response, tools=[])
+    assert validated is response
+
+
+def test_model_kwargs():
+    """Test _model_kwargs property."""
+    llm = Anthropic(
+        model="claude-sonnet-4-5-20250929",
+        temperature=0.5,
+        max_tokens=1000,
+        additional_kwargs={"stop_sequences": ["\n\n"]},
+    )
+
+    kwargs = llm._model_kwargs
+    assert kwargs["model"] == "claude-sonnet-4-5-20250929"
+    assert kwargs["temperature"] == 0.5
+    assert kwargs["max_tokens"] == 1000
+    assert kwargs["stop_sequences"] == ["\n\n"]
+
+
+def test_get_all_kwargs():
+    """Test _get_all_kwargs."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    kwargs = llm._get_all_kwargs(temperature=0.8)
+    assert kwargs["model"] == "claude-sonnet-4-5-20250929"
+    assert kwargs["temperature"] == 0.8  # Overridden by passed kwargs
+    assert kwargs["max_tokens"] == 512  # Default
+
+
+def test_get_all_kwargs_with_thinking():
+    """Test _get_all_kwargs with thinking_dict set."""
+    llm = Anthropic(
+        model="claude-sonnet-4-5-20250929",
+        thinking_dict={"type": "enabled", "budget_tokens": 16000},
+    )
+
+    kwargs = llm._get_all_kwargs()
+    assert "thinking" in kwargs
+    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+
+
+def test_get_all_kwargs_with_tools():
+    """Test _get_all_kwargs with tools set on the LLM."""
+    llm = Anthropic(
+        model="claude-sonnet-4-5-20250929",
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+    )
+
+    kwargs = llm._get_all_kwargs()
+    assert "tools" in kwargs
+    assert len(kwargs["tools"]) == 1
+
+
+def test_get_all_kwargs_with_mcp_servers():
+    """Test _get_all_kwargs with mcp_servers set."""
+    llm = Anthropic(
+        model="claude-sonnet-4-5-20250929",
+        mcp_servers=[{"type": "mcp_server", "name": "test_server"}],
+    )
+
+    kwargs = llm._get_all_kwargs()
+    assert "mcp_servers" in kwargs
+    assert "betas" in kwargs
+    assert kwargs["betas"] == ["mcp-client-2025-04-04"]
+
+
+def test_class_name():
+    """Test class_name class method."""
+    assert Anthropic.class_name() == "Anthropic_LLM"
+
+
+def test_metadata():
+    """Test metadata property."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+    metadata = llm.metadata
+    assert metadata.is_chat_model
+    assert metadata.model_name == "claude-sonnet-4-5-20250929"
+    assert metadata.num_output == 512
+
+
+def test_tokenizer_property():
+    """Test tokenizer property."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+    llm._client = MagicMock()
+    tokenizer = llm.tokenizer
+    assert tokenizer is not None
+    assert hasattr(tokenizer, "encode")
+
+
+def test_map_tool_choice_to_anthropic_thinking_enabled():
+    """Test _map_tool_choice_to_anthropic with thinking enabled."""
+    llm = Anthropic(
+        model="claude-sonnet-4-5-20250929",
+        thinking_dict={"type": "enabled", "budget_tokens": 16000},
+    )
+
+    # When thinking is enabled, tool_required should not force "any" type
+    tool_choice = llm._map_tool_choice_to_anthropic(
+        tool_required=True, allow_parallel_tool_calls=False
+    )
+    assert tool_choice["type"] == "auto"  # Falls back to auto when thinking is enabled
+    assert tool_choice["disable_parallel_tool_use"]
+
+
+def test_init_with_thinking_sets_temperature():
+    """Test that __init__ sets temperature to 1 when thinking is enabled."""
+    llm = Anthropic(
+        model="claude-sonnet-4-5-20250929",
+        temperature=0.5,
+        thinking_dict={"type": "enabled", "budget_tokens": 16000},
+    )
+    # Temperature should be forced to 1 when thinking is enabled
+    assert llm.temperature == 1
+
+
+def test_stream_chat_basic():
+    """Test stream_chat with mocked streaming response."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    from anthropic.types import (
+        ContentBlockStartEvent,
+        ContentBlockDeltaEvent,
+        ContentBlockStopEvent,
+        MessageStartEvent,
+        MessageDeltaEvent,
+        MessageStopEvent,
+        TextBlock as AnthropicTextBlock,
+        TextDelta,
+    )
+
+    # Create mock events for streaming using real types where possible
+    mock_start_event = MagicMock(spec=MessageStartEvent)
+    mock_start_event.type = "message_start"
+    mock_start_event.message = MagicMock()
+    mock_start_event.message.role = "assistant"
+    mock_start_event.message.content = []
+
+    mock_content_start = MagicMock(spec=ContentBlockStartEvent)
+    mock_content_start.type = "content_block_start"
+    mock_content_start.index = 0
+    mock_content_start.content_block = MagicMock(spec=AnthropicTextBlock)
+    mock_content_start.content_block.type = "text"
+    mock_content_start.content_block.text = ""
+
+    mock_content_delta = MagicMock(spec=ContentBlockDeltaEvent)
+    mock_content_delta.type = "content_block_delta"
+    mock_content_delta.index = 0
+    mock_content_delta.delta = MagicMock(spec=TextDelta)
+    mock_content_delta.delta.text = "Hello"
+    mock_content_delta.delta.type = "text_delta"
+
+    mock_content_stop = MagicMock(spec=ContentBlockStopEvent)
+    mock_content_stop.type = "content_block_stop"
+    mock_content_stop.index = 0
+
+    mock_message_delta = MagicMock(spec=MessageDeltaEvent)
+    mock_message_delta.type = "message_delta"
+    mock_message_delta.delta = MagicMock()
+    mock_message_delta.delta.stop_reason = "end_turn"
+    mock_message_delta.usage = MagicMock()
+    mock_message_delta.usage.output_tokens = 20
+
+    mock_message_stop = MagicMock(spec=MessageStopEvent)
+    mock_message_stop.type = "message_stop"
+
+    # Mock the client to return these events
+    llm._client = MagicMock()
+    llm._client.messages.create.return_value = iter([
+        mock_start_event,
+        mock_content_start,
+        mock_content_delta,
+        mock_content_stop,
+        mock_message_delta,
+        mock_message_stop,
+    ])
+
+    messages = [ChatMessage(role=MessageRole.USER, content="Say hello")]
+    stream_gen = llm.stream_chat(messages)
+    responses = list(stream_gen)
+
+    # Should have at least one response with the delta
+    assert len(responses) > 0
+    # The last response should have the accumulated text
+    last_response = responses[-1]
+    assert isinstance(last_response, AnthropicChatResponse)
+
+
+def test_astream_chat_basic():
+    """Test astream_chat with mocked async streaming response."""
+    import asyncio
+
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    from anthropic.types import (
+        ContentBlockStartEvent,
+        ContentBlockDeltaEvent,
+        ContentBlockStopEvent,
+        MessageStartEvent,
+        MessageDeltaEvent,
+        MessageStopEvent,
+        TextBlock as AnthropicTextBlock,
+        TextDelta,
+    )
+
+    mock_start_event = MagicMock(spec=MessageStartEvent)
+    mock_start_event.type = "message_start"
+    mock_start_event.message = MagicMock()
+    mock_start_event.message.role = "assistant"
+    mock_start_event.message.content = []
+
+    mock_content_start = MagicMock(spec=ContentBlockStartEvent)
+    mock_content_start.type = "content_block_start"
+    mock_content_start.index = 0
+    mock_content_start.content_block = MagicMock(spec=AnthropicTextBlock)
+    mock_content_start.content_block.type = "text"
+    mock_content_start.content_block.text = ""
+
+    mock_content_delta = MagicMock(spec=ContentBlockDeltaEvent)
+    mock_content_delta.type = "content_block_delta"
+    mock_content_delta.index = 0
+    mock_content_delta.delta = MagicMock(spec=TextDelta)
+    mock_content_delta.delta.text = "Hello"
+    mock_content_delta.delta.type = "text_delta"
+
+    mock_content_stop = MagicMock(spec=ContentBlockStopEvent)
+    mock_content_stop.type = "content_block_stop"
+    mock_content_stop.index = 0
+
+    mock_message_delta = MagicMock(spec=MessageDeltaEvent)
+    mock_message_delta.type = "message_delta"
+    mock_message_delta.delta = MagicMock()
+    mock_message_delta.delta.stop_reason = "end_turn"
+    mock_message_delta.usage = MagicMock()
+    mock_message_delta.usage.output_tokens = 20
+
+    mock_message_stop = MagicMock(spec=MessageStopEvent)
+    mock_message_stop.type = "message_stop"
+
+    async def mock_create(**kwargs):
+        async def event_generator():
+            yield mock_start_event
+            yield mock_content_start
+            yield mock_content_delta
+            yield mock_content_stop
+            yield mock_message_delta
+            yield mock_message_stop
+        return event_generator()
+
+    # Mock the async client
+    llm._aclient = MagicMock()
+    llm._aclient.messages.create = mock_create
+
+    messages = [ChatMessage(role=MessageRole.USER, content="Say hello")]
+
+    async def run_test():
+        stream_gen = await llm.astream_chat(messages)
+        responses = []
+        async for r in stream_gen:
+            responses.append(r)
+        assert len(responses) > 0
+        last_response = responses[-1]
+        assert isinstance(last_response, AnthropicChatResponse)
+
+    asyncio.run(run_test())
+
+
+def test_achat():
+    """Test achat with mocked async client."""
+    import asyncio
+
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    mock_response = _create_mock_messages_response(
+        [_create_real_text_block("Async response")]
+    )
+
+    async def mock_create(**kwargs):
+        return mock_response
+
+    llm._aclient = MagicMock()
+    llm._aclient.messages.create = mock_create
+
+    messages = [ChatMessage(role=MessageRole.USER, content="Test")]
+
+    async def run_test():
+        response = await llm.achat(messages)
+        assert isinstance(response, AnthropicChatResponse)
+        assert response.message.content == "Async response"
+
+    asyncio.run(run_test())
+
+
+def test_acomplete():
+    """Test acomplete with mocked async client."""
+    import asyncio
+
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    mock_response = _create_mock_messages_response(
+        [_create_real_text_block("Async completion response")]
+    )
+
+    async def mock_create(**kwargs):
+        return mock_response
+
+    llm._aclient = MagicMock()
+    llm._aclient.messages.create = mock_create
+
+    async def run_test():
+        response = await llm.acomplete("Complete this")
+        assert response.text == "Async completion response"
+
+    asyncio.run(run_test())
+
+
+def test_stream_complete():
+    """Test stream_complete."""
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    from anthropic.types import (
+        ContentBlockStartEvent,
+        ContentBlockDeltaEvent,
+        ContentBlockStopEvent,
+        MessageStartEvent,
+        MessageDeltaEvent,
+        MessageStopEvent,
+        TextBlock as AnthropicTextBlock,
+        TextDelta,
+    )
+
+    mock_start_event = MagicMock(spec=MessageStartEvent)
+    mock_start_event.type = "message_start"
+    mock_start_event.message = MagicMock()
+    mock_start_event.message.role = "assistant"
+    mock_start_event.message.content = []
+
+    mock_content_start = MagicMock(spec=ContentBlockStartEvent)
+    mock_content_start.type = "content_block_start"
+    mock_content_start.index = 0
+    mock_content_start.content_block = MagicMock(spec=AnthropicTextBlock)
+    mock_content_start.content_block.type = "text"
+    mock_content_start.content_block.text = ""
+
+    mock_content_delta = MagicMock(spec=ContentBlockDeltaEvent)
+    mock_content_delta.type = "content_block_delta"
+    mock_content_delta.index = 0
+    mock_content_delta.delta = MagicMock(spec=TextDelta)
+    mock_content_delta.delta.text = "Hello world"
+    mock_content_delta.delta.type = "text_delta"
+
+    mock_content_stop = MagicMock(spec=ContentBlockStopEvent)
+    mock_content_stop.type = "content_block_stop"
+    mock_content_stop.index = 0
+
+    mock_message_delta = MagicMock(spec=MessageDeltaEvent)
+    mock_message_delta.type = "message_delta"
+    mock_message_delta.delta = MagicMock()
+    mock_message_delta.delta.stop_reason = "end_turn"
+    mock_message_delta.usage = MagicMock()
+    mock_message_delta.usage.output_tokens = 20
+
+    mock_message_stop = MagicMock(spec=MessageStopEvent)
+    mock_message_stop.type = "message_stop"
+
+    llm._client = MagicMock()
+    llm._client.messages.create.return_value = iter([
+        mock_start_event,
+        mock_content_start,
+        mock_content_delta,
+        mock_content_stop,
+        mock_message_delta,
+        mock_message_stop,
+    ])
+
+    stream_gen = llm.stream_complete("Say hello")
+    responses = list(stream_gen)
+    assert len(responses) > 0
+    last_response = responses[-1]
+    assert isinstance(last_response, AnthropicCompletionResponse)
+
+
+def test_astream_complete():
+    """Test astream_complete with mocked async streaming."""
+    import asyncio
+
+    llm = Anthropic(model="claude-sonnet-4-5-20250929")
+
+    from anthropic.types import (
+        ContentBlockStartEvent,
+        ContentBlockDeltaEvent,
+        ContentBlockStopEvent,
+        MessageStartEvent,
+        MessageDeltaEvent,
+        MessageStopEvent,
+        TextBlock as AnthropicTextBlock,
+        TextDelta,
+    )
+
+    mock_start_event = MagicMock(spec=MessageStartEvent)
+    mock_start_event.type = "message_start"
+    mock_start_event.message = MagicMock()
+    mock_start_event.message.role = "assistant"
+    mock_start_event.message.content = []
+
+    mock_content_start = MagicMock(spec=ContentBlockStartEvent)
+    mock_content_start.type = "content_block_start"
+    mock_content_start.index = 0
+    mock_content_start.content_block = MagicMock(spec=AnthropicTextBlock)
+    mock_content_start.content_block.type = "text"
+    mock_content_start.content_block.text = ""
+
+    mock_content_delta = MagicMock(spec=ContentBlockDeltaEvent)
+    mock_content_delta.type = "content_block_delta"
+    mock_content_delta.index = 0
+    mock_content_delta.delta = MagicMock(spec=TextDelta)
+    mock_content_delta.delta.text = "Hello world"
+    mock_content_delta.delta.type = "text_delta"
+
+    mock_content_stop = MagicMock(spec=ContentBlockStopEvent)
+    mock_content_stop.type = "content_block_stop"
+    mock_content_stop.index = 0
+
+    mock_message_delta = MagicMock(spec=MessageDeltaEvent)
+    mock_message_delta.type = "message_delta"
+    mock_message_delta.delta = MagicMock()
+    mock_message_delta.delta.stop_reason = "end_turn"
+    mock_message_delta.usage = MagicMock()
+    mock_message_delta.usage.output_tokens = 20
+
+    mock_message_stop = MagicMock(spec=MessageStopEvent)
+    mock_message_stop.type = "message_stop"
+
+    async def mock_create(**kwargs):
+        async def event_generator():
+            yield mock_start_event
+            yield mock_content_start
+            yield mock_content_delta
+            yield mock_content_stop
+            yield mock_message_delta
+            yield mock_message_stop
+        return event_generator()
+
+    llm._aclient = MagicMock()
+    llm._aclient.messages.create = mock_create
+
+    async def run_test():
+        stream_gen = await llm.astream_complete("Say hello")
+        responses = []
+        async for r in stream_gen:
+            responses.append(r)
+        assert len(responses) > 0
+        last_response = responses[-1]
+        assert isinstance(last_response, AnthropicCompletionResponse)
+
+    asyncio.run(run_test())
