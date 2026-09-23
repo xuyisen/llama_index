@@ -38,3 +38,8 @@ llama-index-core/llama_index/core/_static
 **/.coverage
 **/coverage.xml
 \nstorage/
+# Shell redirection artifacts
+=[0-9]*
+>[0-9]*
+*.tmp
+*.log
